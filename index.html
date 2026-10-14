@@ -88,7 +88,7 @@
 const SERVICE = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
 const RX      = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
 const $ = id => document.getElementById(id);
-const ARROWS = { R:"→", L:"←", S:"↑", U:"↩", ROUND:"⟳", END:"⚑" };
+const ARROWS = { R:"→", L:"←", S:"↑", SR:"↗", SL:"↖", U:"↩", ROUND:"⟳", END:"⚑" };
 
 function log(m) {
   const el = $("log");
@@ -140,22 +140,37 @@ $("btnConnect").onclick = async () => {
   }
 };
 
+function fmtDist(n) { return n >= 1000 ? (n / 1000).toFixed(1) + "km" : n + "m"; }
+
 function showPreview(msg) {
-  const [code, d] = msg.split(",");
-  if (d === undefined) { $("lcd").textContent = msg.slice(0, 16) + "\n" + msg.slice(16, 32); return; }
-  const n = parseInt(d, 10);
-  const dist = n >= 1000 ? (n / 1000).toFixed(1) + "km" : n + "m";
-  $("lcd").textContent = dist + " " + (ARROWS[code] || code);
+  const f = msg.split(",");
+  if (f.length < 2) { $("lcd").textContent = msg.slice(0, 16) + "\n" + msg.slice(16, 32); return; }
+  const code = f[0], n = parseInt(f[1], 10) || 0;
+  let l1;
+  if (code === "REROUTE") l1 = "Recalcul...";
+  else if (code === "END") l1 = (n > 0 ? fmtDist(n) + " " : "") + "Arrivee";
+  else l1 = fmtDist(n) + " " + (ARROWS[code] || code);
+  const l2 = [];
+  f.slice(2).forEach(x => {
+    const k = x[0], v = x.slice(1);
+    if (k === "X" || k === "E") l2.push("Sortie " + v);
+    else if (k === "V") l2.push("Voie " + [...v].map(c => c === "1" ? "#" : ".").join(""));
+  });
+  $("lcd").textContent = l1 + "\n" + l2.join("  |  ");
 }
 
 function send(msg) {
   showPreview(msg);
   if (!rxChar) { log("(non envoyé, BLE absent) " + msg); return; }
-  const data = new TextEncoder().encode(msg);
-  queue = queue
-    .then(() => rxChar.writeValueWithoutResponse ? rxChar.writeValueWithoutResponse(data) : rxChar.writeValue(data))
-    .then(() => log("→ " + msg))
-    .catch(e => log("Erreur BLE : " + e.message));
+  // Message terminé par "\n" et découpé en paquets de 20 octets (MTU BLE par défaut)
+  const data = new TextEncoder().encode(msg + "\n");
+  for (let o = 0; o < data.length; o += 20) {
+    const part = data.slice(o, o + 20);
+    queue = queue
+      .then(() => rxChar.writeValueWithoutResponse ? rxChar.writeValueWithoutResponse(part) : rxChar.writeValue(part))
+      .catch(e => log("Erreur BLE : " + e.message));
+  }
+  queue = queue.then(() => log("→ " + msg));
 }
 
 document.querySelectorAll("button[data-msg]").forEach(b => b.onclick = () => send(b.dataset.msg));
@@ -192,7 +207,7 @@ $("btnSearch").onclick = async () => {
 
 /* ---------- Itinéraire (OSRM) ---------- */
 let route = null;
-const nav = { watch:null, sim:null, lastSeg:0, off:0, lastReroute:0, wake:null };
+const nav = { watch:null, sim:null, lastSeg:0, off:0, lastReroute:0, wake:null, rerouting:false, hd:null };
 
 function haversine(a, b) {
   const R = 6371000, r = Math.PI / 180;
@@ -201,27 +216,61 @@ function haversine(a, b) {
   return 2 * R * Math.asin(Math.sqrt(h));
 }
 
+function bearing(a, b) {
+  const r = Math.PI / 180, dl = (b[1] - a[1]) * r;
+  const y = Math.sin(dl) * Math.cos(b[0] * r);
+  const x = Math.cos(a[0] * r) * Math.sin(b[0] * r) - Math.sin(a[0] * r) * Math.cos(b[0] * r) * Math.cos(dl);
+  return (Math.atan2(y, x) / r + 360) % 360;
+}
+
+// Codes : R/L = virage, SR/SL = légèrement / bifurcation / sortie, S = tout droit,
+//         U = demi-tour, ROUND = rond-point, END = arrivée
 function maneuverCode(man) {
   const t = man.type, mod = man.modifier || "";
   if (t === "arrive") return "END";
-  if (t === "roundabout" || t === "rotary" || t === "roundabout turn") return "ROUND";
+  if (t === "roundabout" || t === "rotary") return "ROUND";
   if (mod === "uturn") return "U";
-  if (mod.includes("right")) return "R";
-  if (mod.includes("left")) return "L";
+  const fork = (t === "fork" || t === "off ramp");
+  if (mod === "slight right" || (fork && mod === "right")) return "SR";
+  if (mod === "slight left"  || (fork && mod === "left"))  return "SL";
+  if (mod === "right" || mod === "sharp right") return "R";
+  if (mod === "left"  || mod === "sharp left")  return "L";
   return "S";
 }
 
-function routeUrl(from, to) {
+// "0011" = 4 voies, les 2 de droite sont à prendre (gauche -> droite)
+function lanesString(lanes) {
+  if (!lanes || !lanes.length || lanes.length > 8) return "";
+  const s = lanes.map(l => l.valid ? "1" : "0").join("");
+  return (s.includes("0") && s.includes("1")) ? s : "";   // inutile si toutes les voies conviennent
+}
+
+function findLanes(prevRaw, raw) {
+  const cands = [];
+  if (prevRaw && prevRaw.intersections && prevRaw.intersections.length)
+    cands.push(prevRaw.intersections[prevRaw.intersections.length - 1]);
+  if (raw.intersections && raw.intersections.length) cands.push(raw.intersections[0]);
+  for (const it of cands) if (it && it.lanes && it.lanes.length) return lanesString(it.lanes);
+  return "";
+}
+
+function routeUrl(from, to, heading) {
   const c = `${from[1]},${from[0]};${to[1]},${to[0]}`;
-  const q = "?steps=true&geometries=geojson&overview=full";
+  let q = "?steps=true&geometries=geojson&overview=full";
+  if (heading != null) q += `&bearings=${Math.round(heading)},60;`;   // évite un demi-tour au recalcul
   return $("mode").value === "foot"
     ? `https://routing.openstreetmap.de/routed-foot/route/v1/driving/${c}${q}`
     : `https://router.project-osrm.org/route/v1/driving/${c}${q}`;
 }
 
-async function fetchRoute(from) {
-  const res = await fetch(routeUrl(from, [dest.lat, dest.lon]));
-  const j = await res.json();
+async function requestRoute(from, heading) {
+  try { return await (await fetch(routeUrl(from, [dest.lat, dest.lon], heading))).json(); }
+  catch (e) { return { code: "NetworkError", message: e.message }; }
+}
+
+async function fetchRoute(from, heading = null) {
+  let j = await requestRoute(from, heading);
+  if ((j.code !== "Ok" || !j.routes || !j.routes.length) && heading != null) j = await requestRoute(from, null);
   if (j.code !== "Ok" || !j.routes.length) throw new Error(j.message || j.code || "pas d'itinéraire");
   const r = j.routes[0];
   const coords = r.geometry.coordinates.map(([lon, lat]) => [lat, lon]);
@@ -231,16 +280,20 @@ async function fetchRoute(from) {
   const sumDist = rawSteps.reduce((s, x) => s + x.distance, 0) || 1;
   const ratio = cum[cum.length - 1] / sumDist;     // recale les distances des étapes sur la géométrie
   let acc = 0;
-  const steps = rawSteps.map(s => {
-    const o = { start: acc * ratio, code: maneuverCode(s.maneuver), type: s.maneuver.type, mod: s.maneuver.modifier || "", name: s.name || "" };
+  const steps = rawSteps.map((s, idx) => {
+    const man = s.maneuver, code = maneuverCode(man);
+    const o = { start: acc * ratio, code, name: s.name || "", x: "", e: "", v: "" };
+    if (code === "ROUND" && man.exit) o.x = String(man.exit);                                   // n° de sortie du rond-point
+    if (s.exits) o.e = String(s.exits).split(";")[0].replace(/[^0-9A-Za-z]/g, "").slice(0, 4);   // n° de sortie d'autoroute
+    if (code !== "END") o.v = findLanes(rawSteps[idx - 1], s);                                   // voies à prendre
     acc += s.distance;
     return o;
   });
   route = { coords, cum, steps, total: cum[cum.length - 1] };
   nav.lastSeg = 0; nav.off = 0;
   $("routeInfo").textContent = `Itinéraire : ${(route.total / 1000).toFixed(1)} km, ${steps.length} étapes (~${Math.round(r.duration / 60)} min)`;
-  $("btnStart").disabled = false; $("btnSim").disabled = false;
-  log("Itinéraire calculé : " + steps.map(s => s.code).join(" "));
+  if (nav.watch === null && !nav.sim) { $("btnStart").disabled = false; $("btnSim").disabled = false; }
+  log("Itinéraire calculé : " + steps.map(s => [s.code, s.x && "X" + s.x, s.e && "E" + s.e, s.v && "V" + s.v].filter(Boolean).join(":")).join(" "));
 }
 
 function getPosition() {
@@ -278,19 +331,32 @@ function quantize(d) {
 }
 
 let lastMsg = "";
-function onPosition(lat, lon) {
-  if (!route) return;
+
+async function reroute(p, heading) {
+  if (nav.rerouting) return;
+  nav.rerouting = true; nav.lastReroute = Date.now();
+  send("REROUTE,0"); lastMsg = "REROUTE,0";           // retour immédiat sur l'écran des lunettes
+  $("navInfo").textContent = "Recalcul de l'itinéraire…";
+  log("Recalcul de l'itinéraire");
+  try { await fetchRoute(p, heading); lastMsg = ""; }
+  catch (e) { log("Recalcul échoué : " + e.message); }
+  finally { nav.rerouting = false; }
+}
+
+function onPosition(lat, lon, acc, heading) {
+  if (!route || nav.rerouting) return;
   const p = [lat, lon];
+  if (heading != null) nav.hd = heading;
   let pr = project(p, Math.max(0, nav.lastSeg - 3), nav.lastSeg + 150);
   if (pr.d > 40) { const full = project(p, 0, route.coords.length - 2); if (full.d < pr.d) pr = full; }
 
-  if (pr.d > 50) {                               // hors itinéraire
+  const lim = Math.max(30, 2 * (acc || 0));          // seuil de "hors itinéraire" selon la précision GPS
+  if (pr.d > lim) {
     nav.off++;
     $("navInfo").textContent = `Hors itinéraire (${Math.round(pr.d)} m)…`;
-    if (nav.off >= 3 && Date.now() - nav.lastReroute > 15000) {
-      nav.lastReroute = Date.now(); nav.off = 0;
-      log("Recalcul de l'itinéraire");
-      fetchRoute(p).catch(e => log("Recalcul échoué : " + e.message));
+    if ((nav.off >= 2 || pr.d > 3 * lim) && Date.now() - nav.lastReroute > 6000) {
+      nav.off = 0;
+      reroute(p, nav.hd);
     }
     return;
   }
@@ -300,9 +366,13 @@ function onPosition(lat, lon) {
   if (i < 0) i = route.steps.length - 1;
   const step = route.steps[i];
   const dist = Math.max(0, quantize(step.start - pr.along));
-  const msg = `${step.code},${dist}`;
 
-  $("navInfo").textContent = `Prochaine manœuvre : ${step.code} dans ${dist} m ${step.name ? "(" + step.name + ")" : ""} — reste ${((route.total - pr.along) / 1000).toFixed(2)} km`;
+  let msg = `${step.code},${dist}`;
+  if (step.x) msg += ",X" + step.x;
+  if (step.e) msg += ",E" + step.e;
+  if (step.v) msg += ",V" + step.v;
+
+  $("navInfo").textContent = `Prochaine manœuvre : ${msg} ${step.name ? "(" + step.name + ")" : ""} — reste ${((route.total - pr.along) / 1000).toFixed(2)} km`;
   if (msg !== lastMsg) { lastMsg = msg; send(msg); }
 }
 
@@ -323,7 +393,11 @@ function stopNav() {
 $("btnStart").onclick = () => {
   stopNav(); keepAwake();
   nav.watch = navigator.geolocation.watchPosition(
-    pos => onPosition(pos.coords.latitude, pos.coords.longitude),
+    pos => {
+      const c = pos.coords;
+      const hd = (c.heading != null && !isNaN(c.heading) && c.speed > 1.5) ? c.heading : null;
+      onPosition(c.latitude, c.longitude, c.accuracy, hd);
+    },
     err => log("GPS : " + err.message),
     { enableHighAccuracy: true, maximumAge: 1000, timeout: 10000 });
   $("btnStop").disabled = false; $("btnStart").disabled = true; $("btnSim").disabled = true;
@@ -341,7 +415,7 @@ $("btnSim").onclick = () => {
     while (seg < route.cum.length - 2 && route.cum[seg + 1] < travelled) seg++;
     const f = (travelled - route.cum[seg]) / ((route.cum[seg + 1] - route.cum[seg]) || 1);
     const a = route.coords[seg], b = route.coords[seg + 1];
-    onPosition(a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f);
+    onPosition(a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f, 5, bearing(a, b));
   }, 1000);
   $("btnStop").disabled = false; $("btnStart").disabled = true; $("btnSim").disabled = true;
   log("Simulation démarrée");
